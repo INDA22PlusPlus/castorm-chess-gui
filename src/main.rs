@@ -5,7 +5,7 @@ use ggez::{
 };
 use glam::*;
 use std::{env, path};
-const CELL_SIZE: i16 = 160;
+const CELL_SIZE: i16 = 210;
 const GRID_SIZE: i16 = 8;
 const CELL_DIMENSIONS: (i16, i16) = (CELL_SIZE, CELL_SIZE);
 const GRID_DIMENSIONS: (i16, i16) = (GRID_SIZE, GRID_SIZE);
@@ -89,16 +89,16 @@ impl event::EventHandler<ggez::GameError> for MainState {
         }
         canvas.draw(&graphics::Mesh::from_data(ctx, mb.build()), graphics::DrawParam::new().image_scale(false));
         
-        //draw highlights
-        let mut mb = MeshBuilder::new();
-        for m in &self.highlights {
+        //draw selected piece
+        if let Some(h) = self.selected_pos {
+            let mut mb = MeshBuilder::new();
             mb.rectangle(
                 DrawMode::fill(), 
-                graphics::Rect { x: (m.x as i16 * CELL_DIMENSIONS.0) as f32, y: (m.y as i16 * CELL_DIMENSIONS.1) as f32, w: CELL_DIMENSIONS.0 as f32, h: CELL_DIMENSIONS.1 as f32 }, 
-                Color::CYAN).expect("Error in building mesh");
-        }
-        canvas.draw(&graphics::Mesh::from_data(ctx, mb.build()), graphics::DrawParam::new().image_scale(false));
-
+                graphics::Rect { x: (h.x as i16 * CELL_DIMENSIONS.0) as f32, y: (h.y as i16 * CELL_DIMENSIONS.1) as f32, w: CELL_DIMENSIONS.0 as f32, h: CELL_DIMENSIONS.1 as f32 }, 
+                Color::from_rgb(0, 85, 71)).expect("Error in building mesh");
+            canvas.draw(&graphics::Mesh::from_data(ctx, mb.build()), graphics::DrawParam::new().image_scale(false));
+    }
+        
         // draw the pieces
         for row in 0..GRID_DIMENSIONS.0 {
             for column in 0..GRID_DIMENSIONS.1 {
@@ -141,9 +141,26 @@ impl event::EventHandler<ggez::GameError> for MainState {
                     canvas.draw(img, 
                     graphics::DrawParam::new().dest(dst).scale(scale));
                 }
-                
             }
         }
+        
+        //draw highlights
+        let mut mb = MeshBuilder::new();
+        for m in &self.highlights {
+            //mb.rectangle(
+            //    DrawMode::fill(), 
+            //    graphics::Rect { x: (m.x as i16 * CELL_DIMENSIONS.0) as f32, y: (m.y as i16 * CELL_DIMENSIONS.1) as f32, w: CELL_DIMENSIONS.0 as f32, h: CELL_DIMENSIONS.1 as f32 }, 
+            //    Color::CYAN).expect("Error in building mesh");
+            mb.circle(
+                DrawMode::fill(), 
+                Vec2::new((CELL_SIZE as f32 / 2.0) + (m.x as i16 * CELL_DIMENSIONS.0) as f32, (CELL_SIZE as f32 / 2.0) + (m.y as i16 * CELL_DIMENSIONS.1) as f32), 
+                CELL_SIZE as f32 / 10.0, 
+                0.1, 
+                Color::from_rgb(94, 74, 130)).expect("Error in building mesh");
+        }
+        canvas.draw(&graphics::Mesh::from_data(ctx, mb.build()), graphics::DrawParam::new().image_scale(false));
+
+        
         canvas.finish(ctx);
         Ok(())
     }
@@ -161,16 +178,22 @@ impl event::EventHandler<ggez::GameError> for MainState {
             y: (_y / CELL_DIMENSIONS.0 as f32) as i8,
         };
         if let Some(p) = self.selected_pos {
+            println!("here");
             if self.highlights.contains(&pos) {
+                println!("Moving to pos");
                 self.board.perform_move(p, pos, None);
                 self.highlights = Vec::new();
+                self.selected_pos = None;
                 return self.draw(_ctx);
             }
         }
         self.highlights = self.board.get_possible_moves_at_square(pos);
         self.selected_pos = None;
-        if let Some(p) = &self.board.board[pos.x as usize][pos.y as usize] {
-            self.selected_pos = Some(pos);
+        println!("{}", self.board.print(None));
+        if let Some(p) = &self.board.board[pos.y as usize][pos.x as usize] {
+            if p.get_color() == self.board.turn {
+                self.selected_pos = Some(pos);
+            }
         }
 
         self.draw(_ctx)
