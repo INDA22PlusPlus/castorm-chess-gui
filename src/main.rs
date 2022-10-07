@@ -7,7 +7,7 @@ use std::sync::Mutex;
 use glam::*;
 use networking::C2sMessage;
 use networking::S2cMessage;
-use prost::Message;
+use prost::{Message, DecodeError};
 use std::{env, path, io::{Write, Read}};
 use std::net::*;
 mod networking;
@@ -50,13 +50,20 @@ impl Imglib {
         })
     }
 }
+
+#[derive(Eq, PartialEq)]
+enum State {
+    Waiting, 
+    Playing
+}
 struct MainState {
     pieces: Imglib,
     board: chess::board::Board, 
     highlights: Vec<chess::util::Pos>,
     selected_pos: Option<chess::util::Pos>, 
     stream: Option<TcpStream>, 
-    is_client: bool
+    is_client: bool, 
+    state: State
 }
 
 impl MainState {
@@ -67,7 +74,8 @@ impl MainState {
             highlights: Vec::new(), 
             selected_pos: None, 
             stream: None, 
-            is_client: false
+            is_client: false, 
+            state: State::Waiting
         };
 
         //s.draw(ctx);
@@ -75,6 +83,9 @@ impl MainState {
         let (stream, is_client) = Self::get_stream();
         s.stream = Some(stream);
         s.is_client = is_client;
+        if !is_client {
+            s.state = State::Playing;
+        }
 
         Ok(s)
     }
@@ -112,45 +123,120 @@ impl MainState {
             }
         };
 
-        // Set TcpStream to non blocking so that we can do networking in the update thread
-        //stream
-        //    .set_nonblocking(fa)
-        //    .expect("Failed to set stream to non blocking");
+         //Set TcpStream to non blocking so that we can do networking in the update thread
+        stream
+            .set_nonblocking(true)
+            .expect("Failed to set stream to non blocking");
         (stream, is_client)
     }
 
     fn send_c2s_packet(&mut self, data: networking::C2sMessage) {
-        let mut buf: Vec<u8> = Vec::new();
-        data.encode(&mut buf).expect("Couldn't encode message");
-        self.stream.as_ref().unwrap().write(&buf).expect("Failed to send c2s packet");
+        let v = data.encode_to_vec(); //(&mut buf).expect("Couldn't encode message");
+        self.stream.as_ref().unwrap().write(&v).expect("Failed to send c2s packet");
     }
 
     fn send_s2c_packet(&mut self, data: networking::S2cMessage) {
-        let mut buf: Vec<u8> = Vec::new();
-        data.encode(&mut buf).expect("Couldn't encode message");
-        self.stream.as_ref().unwrap().write(&buf).expect("Failed to send c2s packet");
+        let v = data.encode_to_vec(); //(&mut buf).expect("Couldn't encode message");
+        self.stream.as_ref().unwrap().write(&v).expect("Failed to send c2s packet");
     }
 
-    fn receive_c2s_packet(&mut self) -> networking::C2sMessage {
-        let mut buf: Vec<u8> = Vec::new();
-        self.stream.as_ref().unwrap().read(&mut buf).expect("Could not read data");
-        C2sMessage::decode(&buf[..]).unwrap()
+    fn receive_c2s_packet(&mut self) -> Option<networking::C2sMessage> {
+        let mut buf= [0_u8; 512];
+
+        match self.stream.as_ref().unwrap().read(&mut buf) {
+            Ok(p) => {
+                println!("Recieved s2c packet {}", p);
+                return Some(C2sMessage::decode(&buf[..p], ).expect("erro reading"))
+            } ,
+            Err(e) => match e.kind() {
+                std::io::ErrorKind::WouldBlock => return None,
+                _ => panic!("Error: {}", e)
+            }
+        }
     }
 
-    fn receive_s2c_packet(&mut self) -> networking::S2cMessage {
-        let mut buf: Vec<u8> = Vec::new();
-        self.stream.as_ref().unwrap().read(&mut buf).expect("Could not read data");
-        S2cMessage::decode(&buf[..]).unwrap()
+    fn receive_s2c_packet(&mut self) -> Option<networking::S2cMessage> {
+        let mut buf= [0_u8; 512];
+
+        match self.stream.as_ref().unwrap().read(&mut buf) {
+            Ok(p) => {
+                println!("Recieved s2c packet {}", p);
+                return Some(S2cMessage::decode(&buf[..p], ).expect("erro reading"))
+            } ,
+            Err(e) => match e.kind() {
+                std::io::ErrorKind::WouldBlock => return None,
+                _ => panic!("Error: {}", e)
+            }
+        }
+        
     }
 }
 
 impl event::EventHandler<ggez::GameError> for MainState {
     fn update(&mut self, ctx: &mut Context) -> GameResult {
 
-        if !self.is_client {
+        if self.is_client {
+            let data = self.receive_s2c_packet();
+            if data.is_some() {
+                match data.unwrap().msg {
+                    None => println!("Received NONE msg!!!"), 
+                    Some(msg) => {
+                        println!("Received SOME msg!!!!");
+                        match msg {
+                            networking::s2c_message::Msg::Move(m) => {
+                                let p = chess::util::Pos {
+                                    x: (m.from_square % 8) as i8,
+                                    y: (m.from_square / 8) as i8,
+                                };
+                                let pos = chess::util::Pos {
+                                    x: (m.to_square % 8) as i8,
+                                    y: (m.to_square / 8) as i8,
+                                };
+                                self.board.perform_move(p, pos, None);
+                                println!("RECEIVED MOVE PACKET");
+                                self.draw(ctx);
+                            },
+                            networking::s2c_message::Msg::ConnectAck(ca) => {
+                                println!("RECEIVED COnnecte Ack PACKET");
+    
+                            },
+                            networking::s2c_message::Msg::MoveAck(ma) => {
+                                println!("RECEIVED move Ack PACKET");
+    
+                            },
+                        }
+                    }
+                }
+            }
+            
+        } else {
             let data = self.receive_c2s_packet();
-            let msg = data.msg.unwrap();
-            println!("RECEIVED PACKET");
+            if data.is_some() {
+                match data.unwrap().msg {
+                    None => (), 
+                    Some(msg) => {
+                        match msg {
+                            networking::c2s_message::Msg::Move(m) => {
+                                let p = chess::util::Pos {
+                                    x: (m.from_square % 8) as i8,
+                                    y: (m.from_square / 8) as i8,
+                                };
+                                let pos = chess::util::Pos {
+                                    x: (m.to_square % 8) as i8,
+                                    y: (m.to_square / 8) as i8,
+                                };
+                                self.board.perform_move(p, pos, None);
+                                println!("RECEIVED MOVE PACKET");
+                                self.draw(ctx);
+                            },
+                            networking::c2s_message::Msg::ConnectRequest(_) => {
+                                println!("RECEIVED connect request PACKET");
+    
+                            },
+                        }
+                    }
+                }
+            }
         }
         self.draw(ctx);
 
@@ -173,7 +259,6 @@ impl event::EventHandler<ggez::GameError> for MainState {
                     DrawMode::fill(), 
                     graphics::Rect { x: (row * CELL_DIMENSIONS.0) as f32, y: (column * CELL_DIMENSIONS.1) as f32, w: CELL_DIMENSIONS.0 as f32, h: CELL_DIMENSIONS.1 as f32 }, 
                     color).expect("Error in building mesh");
-                
             }
         }
         
@@ -277,8 +362,6 @@ impl event::EventHandler<ggez::GameError> for MainState {
                     Ok(r) => println!("OK"), 
                     Err(e) => println!("Err")
                 }
-
-                
                 
                 if self.is_client {
                     let data = C2sMessage {
@@ -288,6 +371,8 @@ impl event::EventHandler<ggez::GameError> for MainState {
                             promotion: None,
                         })),
                     };
+                    println!("SENDING MOVE PACKET CLient");
+                    self.state = State::Waiting;
                     self.send_c2s_packet(data);
                 } else {
                     let data = S2cMessage {
@@ -297,6 +382,9 @@ impl event::EventHandler<ggez::GameError> for MainState {
                             promotion: None,
                         })),
                     };
+                    println!("SENDING MOVE PACKET Server");
+                    self.state = State::Waiting;
+                    self.send_s2c_packet(data);
                 }
 
                 self.highlights = Vec::new();
