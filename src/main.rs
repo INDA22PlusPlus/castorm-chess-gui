@@ -1,11 +1,18 @@
 use ggez::{
-    event,
+    event::{self, EventHandler},
     graphics::{self, Color, MeshBuilder, Image, DrawMode},
     Context, GameResult, conf,
 };
+use std::sync::Mutex;
 use glam::*;
-use std::{env, path};
-const CELL_SIZE: i16 = 210;
+use networking::C2sMessage;
+use networking::S2cMessage;
+use prost::Message;
+use std::{env, path, io::{Write, Read}};
+use std::net::*;
+mod networking;
+use std::thread;
+const CELL_SIZE: i16 = 140;
 const GRID_SIZE: i16 = 8;
 const CELL_DIMENSIONS: (i16, i16) = (CELL_SIZE, CELL_SIZE);
 const GRID_DIMENSIONS: (i16, i16) = (GRID_SIZE, GRID_SIZE);
@@ -47,24 +54,106 @@ struct MainState {
     pieces: Imglib,
     board: chess::board::Board, 
     highlights: Vec<chess::util::Pos>,
-    selected_pos: Option<chess::util::Pos>
+    selected_pos: Option<chess::util::Pos>, 
+    stream: Option<TcpStream>, 
+    is_client: bool
 }
 
 impl MainState {
     fn new(ctx: &mut Context) -> GameResult<MainState> {
-        let s = MainState { 
+        let mut s = MainState { 
             pieces: Imglib::new(ctx)?,
             board: chess::board::Board::new(), 
             highlights: Vec::new(), 
-            selected_pos: None
-         };
+            selected_pos: None, 
+            stream: None, 
+            is_client: false
+        };
 
-         Ok(s)
+        //s.draw(ctx);
+
+        let (stream, is_client) = Self::get_stream();
+        s.stream = Some(stream);
+        s.is_client = is_client;
+
+        Ok(s)
+    }
+
+    
+
+    fn get_stream() -> (TcpStream, bool) {
+        // A stream and a boolean indicating wether or not the program is a host or a client
+        let (stream, is_client) = {
+            let mut args = std::env::args();
+            // Skip path to program
+            let _ = args.next();
+
+            // Get first argument after path to program
+            let host_or_client = args
+                .next()
+                .expect("Expected arguments: host or client 'ip'");
+
+            match host_or_client.as_str() {
+                // If the program is running as host we listen on port 8080 until we get a
+                // connection then we return the stream.
+                "host" => {
+                    let listener = TcpListener::bind("127.0.0.1:1337").unwrap();
+                    (listener.incoming().next().unwrap().unwrap(), false)
+                }
+                // If the program is running as a client we connect to the specified IP address and
+                // return the stream.
+                "client" => {
+                    let ip = args.next().expect("Expected ip address after client");
+                    let stream = TcpStream::connect(ip).expect("Failed to connect to host");
+                    (stream, true)
+                }
+                // Only --host and --client are valid arguments
+                _ => panic!("Unknown command: {}", host_or_client),
+            }
+        };
+
+        // Set TcpStream to non blocking so that we can do networking in the update thread
+        //stream
+        //    .set_nonblocking(fa)
+        //    .expect("Failed to set stream to non blocking");
+        (stream, is_client)
+    }
+
+    fn send_c2s_packet(&mut self, data: networking::C2sMessage) {
+        let mut buf: Vec<u8> = Vec::new();
+        data.encode(&mut buf).expect("Couldn't encode message");
+        self.stream.as_ref().unwrap().write(&buf).expect("Failed to send c2s packet");
+    }
+
+    fn send_s2c_packet(&mut self, data: networking::S2cMessage) {
+        let mut buf: Vec<u8> = Vec::new();
+        data.encode(&mut buf).expect("Couldn't encode message");
+        self.stream.as_ref().unwrap().write(&buf).expect("Failed to send c2s packet");
+    }
+
+    fn receive_c2s_packet(&mut self) -> networking::C2sMessage {
+        let mut buf: Vec<u8> = Vec::new();
+        self.stream.as_ref().unwrap().read(&mut buf).expect("Could not read data");
+        C2sMessage::decode(&buf[..]).unwrap()
+    }
+
+    fn receive_s2c_packet(&mut self) -> networking::S2cMessage {
+        let mut buf: Vec<u8> = Vec::new();
+        self.stream.as_ref().unwrap().read(&mut buf).expect("Could not read data");
+        S2cMessage::decode(&buf[..]).unwrap()
     }
 }
 
 impl event::EventHandler<ggez::GameError> for MainState {
     fn update(&mut self, ctx: &mut Context) -> GameResult {
+
+        if !self.is_client {
+            let data = self.receive_c2s_packet();
+            let msg = data.msg.unwrap();
+            println!("RECEIVED PACKET");
+        }
+        self.draw(ctx);
+
         Ok(())
     }
 
@@ -87,6 +176,7 @@ impl event::EventHandler<ggez::GameError> for MainState {
                 
             }
         }
+        
         canvas.draw(&graphics::Mesh::from_data(ctx, mb.build()), graphics::DrawParam::new().image_scale(false));
         
         //draw selected piece
@@ -97,6 +187,7 @@ impl event::EventHandler<ggez::GameError> for MainState {
                 graphics::Rect { x: (h.x as i16 * CELL_DIMENSIONS.0) as f32, y: (h.y as i16 * CELL_DIMENSIONS.1) as f32, w: CELL_DIMENSIONS.0 as f32, h: CELL_DIMENSIONS.1 as f32 }, 
                 Color::from_rgb(0, 85, 71)).expect("Error in building mesh");
             canvas.draw(&graphics::Mesh::from_data(ctx, mb.build()), graphics::DrawParam::new().image_scale(false));
+            
     }
         
         // draw the pieces
@@ -181,7 +272,33 @@ impl event::EventHandler<ggez::GameError> for MainState {
             println!("here");
             if self.highlights.contains(&pos) {
                 println!("Moving to pos");
-                self.board.perform_move(p, pos, None);
+                let res = self.board.perform_move(p, pos, None);
+                match res {
+                    Ok(r) => println!("OK"), 
+                    Err(e) => println!("Err")
+                }
+
+                
+                
+                if self.is_client {
+                    let data = C2sMessage {
+                        msg: Some(networking::c2s_message::Msg::Move(networking::Move {
+                            from_square: (p.x + p.y * 8) as u32,
+                            to_square: (pos.x + pos.y * 8) as u32,
+                            promotion: None,
+                        })),
+                    };
+                    self.send_c2s_packet(data);
+                } else {
+                    let data = S2cMessage {
+                        msg: Some(networking::s2c_message::Msg::Move(networking::Move {
+                            from_square: (p.x + p.y * 8) as u32,
+                            to_square: (pos.x + pos.y * 8) as u32,
+                            promotion: None,
+                        })),
+                    };
+                }
+
                 self.highlights = Vec::new();
                 self.selected_pos = None;
                 return self.draw(_ctx);
@@ -199,8 +316,8 @@ impl event::EventHandler<ggez::GameError> for MainState {
         self.draw(_ctx)
     }
 }
-
 pub fn main() -> GameResult {
+
     let resource_dir = if let Ok(manifest_dir) = env::var("CARGO_MANIFEST_DIR") {
         let mut path = path::PathBuf::from(manifest_dir);
         path.push("resources");
