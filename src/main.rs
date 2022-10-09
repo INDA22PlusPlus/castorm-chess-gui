@@ -1,61 +1,57 @@
 use ggez::{
     event::{self, EventHandler},
-    graphics::{self, Color, MeshBuilder, Image, DrawMode},
+    graphics::{self, Color, MeshBuilder, DrawMode},
     Context, GameResult, conf,
 };
-use std::sync::Mutex;
 use glam::*;
 use networking::C2sMessage;
 use networking::S2cMessage;
-use prost::{Message, DecodeError};
+use prost::{Message};
 use std::{env, path, io::{Write, Read}};
 use std::net::*;
 mod networking;
-use std::thread;
-const CELL_SIZE: i16 = 140;
-const GRID_SIZE: i16 = 8;
-const CELL_DIMENSIONS: (i16, i16) = (CELL_SIZE, CELL_SIZE);
-const GRID_DIMENSIONS: (i16, i16) = (GRID_SIZE, GRID_SIZE);
-const SCREEN_DIMENSIONS: (i16, i16) = (CELL_DIMENSIONS.0 * GRID_DIMENSIONS.0, CELL_DIMENSIONS.1 * GRID_DIMENSIONS.1);
-struct Imglib {
-    black_pawn: Image,
-    black_rook: Image, 
-    black_knight: Image, 
-    black_bishop: Image,
-    black_queen: Image, 
-    black_king: Image,
-    white_pawn: Image,
-    white_rook: Image, 
-    white_knight: Image, 
-    white_bishop: Image,
-    white_queen: Image, 
-    white_king: Image
-}
-impl Imglib {
-    fn new(ctx: &mut Context) -> GameResult<Imglib> {
-        Ok(
-        Imglib { 
-            black_pawn: Image::from_path(ctx, "/b_pawn.png", true)?, 
-            black_rook: Image::from_path(ctx, "/b_rook.png", true)?,
-            black_knight: Image::from_path(ctx, "/b_knight.png", true)?,
-            black_bishop: Image::from_path(ctx, "/b_bishop.png", true)?, 
-            black_queen: Image::from_path(ctx, "/b_queen.png", true)?, 
-            black_king: Image::from_path(ctx, "/b_king.png", true)?, 
-            white_pawn: Image::from_path(ctx, "/w_pawn.png", true)?, 
-            white_rook: Image::from_path(ctx, "/w_rook.png", true)?, 
-            white_knight: Image::from_path(ctx, "/w_knight.png", true)?,
-            white_bishop: Image::from_path(ctx, "/w_bishop.png", true)?, 
-            white_queen: Image::from_path(ctx, "/w_queen.png", true)?, 
-            white_king: Image::from_path(ctx, "/w_king.png", true)?
-        })
-    }
+mod utils;
+use utils::*;
+
+fn get_stream() -> (TcpStream, bool) {
+    // A stream and a boolean indicating wether or not the program is a host or a client
+    let (stream, is_client) = {
+        let mut args = std::env::args();
+        // Skip path to program
+        let _ = args.next();
+
+        // Get first argument after path to program
+        let host_or_client = args
+            .next()
+            .expect("Expected arguments: host or client 'ip'");
+
+        match host_or_client.as_str() {
+            // If the program is running as host we listen on port 8080 until we get a
+            // connection then we return the stream.
+            "host" => {
+                let listener = TcpListener::bind("127.0.0.1:1337").unwrap();
+                (listener.incoming().next().unwrap().unwrap(), false)
+            }
+            // If the program is running as a client we connect to the specified IP address and
+            // return the stream.
+            "client" => {
+                let ip = args.next().expect("Expected ip address after client");
+                let stream = TcpStream::connect(ip).expect("Failed to connect to host");
+                (stream, true)
+            }
+            // Only --host and --client are valid arguments
+            _ => panic!("Unknown command: {}", host_or_client),
+        }
+    };
+
+     //Set TcpStream to non blocking so that we can do networking in the update thread
+    stream
+        .set_nonblocking(true)
+        .expect("Failed to set stream to non blocking");
+    (stream, is_client)
 }
 
-#[derive(Eq, PartialEq)]
-enum State {
-    Waiting, 
-    Playing
-}
+
 struct MainState {
     pieces: Imglib,
     board: chess::board::Board, 
@@ -78,57 +74,13 @@ impl MainState {
             state: State::Waiting
         };
 
-        //s.draw(ctx);
-
-        let (stream, is_client) = Self::get_stream();
-        s.stream = Some(stream);
-        s.is_client = is_client;
-        if !is_client {
-            s.state = State::Playing;
-        }
-
+        s.draw(ctx);
         Ok(s)
     }
 
     
 
-    fn get_stream() -> (TcpStream, bool) {
-        // A stream and a boolean indicating wether or not the program is a host or a client
-        let (stream, is_client) = {
-            let mut args = std::env::args();
-            // Skip path to program
-            let _ = args.next();
-
-            // Get first argument after path to program
-            let host_or_client = args
-                .next()
-                .expect("Expected arguments: host or client 'ip'");
-
-            match host_or_client.as_str() {
-                // If the program is running as host we listen on port 8080 until we get a
-                // connection then we return the stream.
-                "host" => {
-                    let listener = TcpListener::bind("127.0.0.1:1337").unwrap();
-                    (listener.incoming().next().unwrap().unwrap(), false)
-                }
-                // If the program is running as a client we connect to the specified IP address and
-                // return the stream.
-                "client" => {
-                    let ip = args.next().expect("Expected ip address after client");
-                    let stream = TcpStream::connect(ip).expect("Failed to connect to host");
-                    (stream, true)
-                }
-                // Only --host and --client are valid arguments
-                _ => panic!("Unknown command: {}", host_or_client),
-            }
-        };
-
-         //Set TcpStream to non blocking so that we can do networking in the update thread
-        stream
-            .set_nonblocking(true)
-            .expect("Failed to set stream to non blocking");
-        (stream, is_client)
-    }
+    
 
     fn send_c2s_packet(&mut self, data: networking::C2sMessage) {
         let v = data.encode_to_vec(); //(&mut buf).expect("Couldn't encode message");
@@ -142,12 +94,12 @@ impl MainState {
 
     fn receive_c2s_packet(&mut self) -> Option<networking::C2sMessage> {
         let mut buf= [0_u8; 512];
-
+        if self.stream.is_none() { return None }
         match self.stream.as_ref().unwrap().read(&mut buf) {
             Ok(p) => {
                 println!("Recieved s2c packet {}", p);
                 return Some(C2sMessage::decode(&buf[..p], ).expect("erro reading"))
-            } ,
+            },
             Err(e) => match e.kind() {
                 std::io::ErrorKind::WouldBlock => return None,
                 _ => panic!("Error: {}", e)
@@ -157,7 +109,7 @@ impl MainState {
 
     fn receive_s2c_packet(&mut self) -> Option<networking::S2cMessage> {
         let mut buf= [0_u8; 512];
-
+        if self.stream.is_none() { return None }
         match self.stream.as_ref().unwrap().read(&mut buf) {
             Ok(p) => {
                 println!("Recieved s2c packet {}", p);
@@ -313,7 +265,7 @@ impl event::EventHandler<ggez::GameError> for MainState {
                     }
 
                     let dst = glam::Vec2::new((row * CELL_DIMENSIONS.0) as f32, (column * CELL_DIMENSIONS.1) as f32);
-                    let scale = glam::Vec2::new((CELL_SIZE as f32) / (img.width() as f32), (CELL_SIZE as f32) / (img.height() as f32));
+                    let scale = glam::Vec2::new((CELL_DIMENSIONS.0 as f32) / (img.width() as f32), (CELL_DIMENSIONS.1 as f32) / (img.height() as f32));
                     canvas.draw(img, 
                     graphics::DrawParam::new().dest(dst).scale(scale));
                 }
@@ -329,8 +281,8 @@ impl event::EventHandler<ggez::GameError> for MainState {
             //    Color::CYAN).expect("Error in building mesh");
             mb.circle(
                 DrawMode::fill(), 
-                Vec2::new((CELL_SIZE as f32 / 2.0) + (m.x as i16 * CELL_DIMENSIONS.0) as f32, (CELL_SIZE as f32 / 2.0) + (m.y as i16 * CELL_DIMENSIONS.1) as f32), 
-                CELL_SIZE as f32 / 10.0, 
+                Vec2::new((CELL_DIMENSIONS.0 as f32 / 2.0) + (m.x as i16 * CELL_DIMENSIONS.0) as f32, (CELL_DIMENSIONS.1 as f32 / 2.0) + (m.y as i16 * CELL_DIMENSIONS.1) as f32), 
+                CELL_DIMENSIONS.0 as f32 / 10.0, 
                 0.1, 
                 Color::from_rgb(94, 74, 130)).expect("Error in building mesh");
         }
@@ -403,6 +355,21 @@ impl event::EventHandler<ggez::GameError> for MainState {
 
         self.draw(_ctx)
     }
+
+    fn key_down_event(
+            &mut self,
+            ctx: &mut Context,
+            input: ggez::input::keyboard::KeyInput,
+            _repeated: bool,
+        ) -> Result<(), ggez::GameError> {
+            if input.keycode.unwrap() == ggez::input::keyboard::KeyCode::Return {
+                let (stream, is_client) = get_stream();
+                self.stream = Some(stream);
+                self.is_client = is_client;
+            }
+
+            self.draw(ctx)
+    }
 }
 pub fn main() -> GameResult {
 
@@ -420,6 +387,8 @@ pub fn main() -> GameResult {
     .window_mode(conf::WindowMode::default().dimensions(SCREEN_DIMENSIONS.0 as f32, SCREEN_DIMENSIONS.1 as f32))
     .build()?;
 
-    let state = MainState::new(&mut ctx)?;
+    let mut state = MainState::new(&mut ctx)?;
+
+    state.draw(&mut ctx);
     event::run(ctx, events_loop, state)
 }
